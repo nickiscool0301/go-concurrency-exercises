@@ -10,6 +10,7 @@ package main
 
 import (
 	"container/list"
+	"sync"
 	"testing"
 )
 
@@ -27,29 +28,60 @@ type page struct {
 	Value string
 }
 
+type call struct {
+	wg  sync.WaitGroup
+	val string
+}
+
 // KeyStoreCache is a LRU cache for string key-value pairs
 type KeyStoreCache struct {
-	cache map[string]*list.Element
-	pages list.List
-	load  func(string) string
+	mu       sync.Mutex
+	cache    map[string]*list.Element
+	pages    list.List
+	load     func(string) string
+	inflight map[string]*call
 }
 
 // New creates a new KeyStoreCache
 func New(load KeyStoreCacheLoader) *KeyStoreCache {
 	return &KeyStoreCache{
-		load:  load.Load,
-		cache: make(map[string]*list.Element),
+		load:     load.Load,
+		cache:    make(map[string]*list.Element),
+		inflight: make(map[string]*call),
 	}
 }
 
 // Get gets the key from cache, loads it from the source if needed
 func (k *KeyStoreCache) Get(key string) string {
+	k.mu.Lock()
+
 	if e, ok := k.cache[key]; ok {
 		k.pages.MoveToFront(e)
-		return e.Value.(page).Value
+		val := e.Value.(page).Value
+		k.mu.Unlock()
+		return val
 	}
+
+	// already loading - wait for them -> wq.Wait()
+	if c, ok := k.inflight[key]; ok {
+		k.mu.Unlock()
+		c.wg.Wait()
+		return c.val
+	}
+
+	c := &call{}
+	c.wg.Add(1)
+	k.inflight[key] = c
+	k.mu.Unlock()
+
+	c.val = k.load(key)
+	c.wg.Done()
+
+	k.mu.Lock()
+	delete(k.inflight, key)
+
 	// Miss - load from database and save it in cache
-	p := page{key, k.load(key)}
+	p := page{key, c.val}
 	// if cache is full remove the least used item
 	if len(k.cache) >= CacheSize {
 		end := k.pages.Back()
@@ -60,6 +92,7 @@ func (k *KeyStoreCache) Get(key string) string {
 	}
 	k.pages.PushFront(p)
 	k.cache[key] = k.pages.Front()
+	k.mu.Unlock()
 	return p.Value
 }
 
